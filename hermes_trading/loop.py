@@ -21,14 +21,47 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
 from hermes_trading.adapters import price
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger(__name__)
 
-PAPER_MODE = os.getenv("HERMES_TRADING_MODE", "paper") == "paper"
-STATE_FILE = Path("state/worker_state.json")
-TRADES_FILE = Path("state/trades.jsonl")
+PAPER_MODE     = os.getenv("HERMES_TRADING_MODE", "paper") == "paper"
+STATE_FILE     = Path("state/worker_state.json")
+TRADES_FILE    = Path("state/trades.jsonl")
+STRATEGY_FILE  = Path("state/strategy.yaml")
+GOAL_FILE      = Path("state/goal.yaml")
+
+
+def load_params() -> dict:
+    """Read tunable parameters from strategy.yaml. Falls back to safe defaults."""
+    try:
+        raw = yaml.safe_load(STRATEGY_FILE.read_text()) or {}
+        e = raw.get("entry", {})
+        return {
+            "swing_lookback":    int(e.get("swing_lookback",    2)),
+            "min_wick_ratio":    float(e.get("min_wick_ratio",  0.30)),
+            "valid_window_bars": int(e.get("valid_window_bars", 2)),
+            "sl_multiplier":     float(e.get("sl_multiplier",   0.50)),
+        }
+    except Exception:
+        return {"swing_lookback": 2, "min_wick_ratio": 0.30,
+                "valid_window_bars": 2, "sl_multiplier": 0.50}
+
+
+def reflection_due() -> bool:
+    """Return True if a reflection cycle should fire now."""
+    try:
+        goal = yaml.safe_load(GOAL_FILE.read_text()) or {}
+    except Exception:
+        goal = {}
+    every = int(goal.get("reflection_every", 5))
+    if not TRADES_FILE.exists():
+        return False
+    closed = sum(1 for line in TRADES_FILE.read_text().splitlines() if line.strip())
+    # fire on exact multiples so we don't double-fire
+    return closed > 0 and closed % every == 0
 
 # ── state helpers ──────────────────────────────────────────────────────────────
 
@@ -54,7 +87,7 @@ def log_trade(record: dict) -> None:
 
 # ── swing level detection ──────────────────────────────────────────────────────
 
-def swing_highs(candles: list, n: int = 2) -> list:
+def swing_highs(candles: list, n: int = 2) -> list:  # noqa: E302
     """Prices of swing highs in the completed candle list (n-bar pivot)."""
     result = []
     for i in range(n, len(candles) - n):
@@ -76,16 +109,15 @@ def swing_lows(candles: list, n: int = 2) -> list:
 
 # ── sweep detection ────────────────────────────────────────────────────────────
 
-def detect_sweep(candle: dict, highs: list, lows: list) -> dict | None:
+def detect_sweep(candle: dict, highs: list, lows: list,
+                 min_wick_ratio: float = 0.30) -> dict | None:
     """
     Returns a setup dict if the candle swept a level, else None.
 
     Bearish sweep of a high  → short setup.
     Bullish sweep of a low   → long setup.
     """
-    body_size = abs(candle["close"] - candle["open"])
     candle_range = candle["high"] - candle["low"]
-    # skip tiny candles (spread noise)
     if candle_range < 10:
         return None
 
@@ -95,8 +127,7 @@ def detect_sweep(candle: dict, highs: list, lows: list) -> dict | None:
                 and candle["close"] < level
                 and candle["close"] < candle["open"]):
             wick = candle["high"] - max(candle["open"], candle["close"])
-            # wick must be meaningful — at least 30 % of total range
-            if wick / candle_range >= 0.30:
+            if wick / candle_range >= min_wick_ratio:
                 return {
                     "direction": "short",
                     "swept_level": level,
@@ -110,7 +141,7 @@ def detect_sweep(candle: dict, highs: list, lows: list) -> dict | None:
                 and candle["close"] > level
                 and candle["close"] > candle["open"]):
             wick = min(candle["open"], candle["close"]) - candle["low"]
-            if wick / candle_range >= 0.30:
+            if wick / candle_range >= min_wick_ratio:
                 return {
                     "direction": "long",
                     "swept_level": level,
@@ -206,11 +237,10 @@ GRANULARITY_1M = 60
 async def loop_once(state: dict) -> dict:
     """One evaluation cycle. Mutates and returns state."""
     now_ts = int(datetime.now(timezone.utc).timestamp())
+    params = load_params()
 
-    # Align current 15m window start
     window_start_ts = (now_ts // GRANULARITY_15M) * GRANULARITY_15M
 
-    # ── fetch candles ──────────────────────────────────────────────────────────
     candles_15m, candles_1m = await asyncio.gather(
         price.fetch_ohlcv(granularity=GRANULARITY_15M, limit=25),
         price.fetch_ohlcv(granularity=GRANULARITY_1M, limit=30),
@@ -220,7 +250,6 @@ async def loop_once(state: dict) -> dict:
         logger.warning("candle fetch returned empty — skipping tick")
         return state
 
-    # Completed 15m candles only (exclude the still-forming current bar)
     completed_15m = [c for c in candles_15m if c["timestamp"] < window_start_ts]
 
     # ── check trade exit ───────────────────────────────────────────────────────
@@ -237,6 +266,15 @@ async def loop_once(state: dict) -> dict:
             )
             state["current_trade"] = None
             state["active_setup"] = None
+
+            # ── reflection trigger ─────────────────────────────────────────────
+            if reflection_due():
+                logger.info("Reflection cycle triggered — calling Anthropic API")
+                try:
+                    from hermes_trading.reflect import run_reflection
+                    run_reflection()
+                except Exception as e:
+                    logger.error(f"Reflection failed: {e}")
         else:
             logger.info(
                 f"Trade OPEN | {state['current_trade']['direction']} "
@@ -249,10 +287,9 @@ async def loop_once(state: dict) -> dict:
     # ── check for 1m entry on existing setup ──────────────────────────────────
     if state["active_setup"]:
         setup = state["active_setup"]
-        # Setup expires at the end of the 15m window after the sweep
-        setup_expires = setup["sweep_ts"] + GRANULARITY_15M * 2
+        setup_expires = setup["sweep_ts"] + GRANULARITY_15M * params["valid_window_bars"]
         if now_ts > setup_expires:
-            logger.info(f"Setup expired (no 1m entry in time) | {setup['direction']} @ trigger={setup['trigger_line']:.2f}")
+            logger.info(f"Setup expired | {setup['direction']} trigger={setup['trigger_line']:.2f}")
             state["active_setup"] = None
         else:
             entry = find_entry(candles_1m, setup, window_start_ts)
@@ -278,27 +315,27 @@ async def loop_once(state: dict) -> dict:
         logger.info("Not enough 15m history yet — waiting")
         return state
 
-    highs = swing_highs(completed_15m)
-    lows = swing_lows(completed_15m)
+    n = params["swing_lookback"]
+    highs = swing_highs(completed_15m, n=n)
+    lows  = swing_lows(completed_15m,  n=n)
 
-    # Check the most recent completed 15m candle for a sweep
     recent = completed_15m[-1]
     if recent["timestamp"] in state["seen_sweep_ts"]:
         logger.info("No new sweep detected — standing by")
         return state
 
-    setup = detect_sweep(recent, highs, lows)
+    setup = detect_sweep(recent, highs, lows, min_wick_ratio=params["min_wick_ratio"])
     if setup:
         state["active_setup"] = setup
         state["seen_sweep_ts"].append(recent["timestamp"])
-        state["seen_sweep_ts"] = state["seen_sweep_ts"][-50:]  # keep last 50
+        state["seen_sweep_ts"] = state["seen_sweep_ts"][-50:]
         logger.info(
             f"SWEEP DETECTED | {setup['direction']} | level={setup['swept_level']:.2f} "
             f"trigger={setup['trigger_line']:.2f} — watching 1m for entry"
         )
     else:
         logger.info(
-            f"No sweep | last 15m bar H={recent['high']:.2f} L={recent['low']:.2f} "
+            f"No sweep | last 15m H={recent['high']:.2f} L={recent['low']:.2f} "
             f"C={recent['close']:.2f} | highs={[round(h,1) for h in highs[-3:]]} "
             f"lows={[round(l,1) for l in lows[-3:]]}"
         )

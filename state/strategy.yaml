@@ -1,41 +1,9 @@
 version: "01"
-timeframe: "1m"
-strategy_name: "1-Minute Scalping with 15-Minute Liquidity Sweeps (Wick Rejection)"
+strategy_name: "1-Minute Scalping with 15-Minute Liquidity Sweeps"
 
-step_1_mark_15m_levels:
-  description: "Identify untouched swing highs/lows on 15m chart"
-  quality_confluences:
-    - inside_imbalances: "Gaps price partially filled"
-    - structural_highs_lows: "Market structure breakout patterns"
-    - session_extremes: "Asia (20-00), London (02-05), New York (07-10) session highs/lows"
-  lookback_candles: 20
-
-step_2_wick_rejection:
-  description: "Wait for price to touch level and close in opposite direction"
-  touch_requirement: "Price must reach the marked high or low"
-  close_requirement: "Candle must close opposite to breakout direction"
-  same_color_preference: "Bullish candle for upside sweep, bearish for downside (less rejection = better entry)"
-  strong_rejection_avoidance: "Avoid very strong rejection candles (lower probability)"
-
-step_3_1m_entry_on_next_candle:
-  description: "Switch to 1m chart, use 15m close/open as trigger"
-  trigger_line: "Previous 15m closing price = next 15m opening price"
-  entry_signal: "1m candle closes above/below trigger line (depending on direction)"
-  entry_variations:
-    - immediate: "Enter on close above/below trigger line"
-    - retrace: "Wait for retracement to trigger line, then enter"
-    - dip_and_rip: "Price dips below/spikes above, then reverses and closes through trigger line"
-  
-entry_and_exit:
-  stop_loss_tight: "Just below 1m candle that broke above (or above for shorts)"
-  stop_loss_safe: "Below 15m candle (wider, safer)"
-  target_primary: "Next 15m swing high/low (structural level)"
-  target_secondary: "Next session extreme (if in confluence area)"
-  risk_reward_ratio_minimum: 4
-  position_size_r: 0.5
-
-trade_management:
-  partials_at_50pct: "Take 50% profit at midpoint of target range"
-  break_even_rule: "Move stop to break even after decent move"
-  max_trades_per_day: 5
-  avoid_ranges: "Skip setups inside non-structural ranges"
+# --- tunable parameters (Hermes changes ONE per reflection cycle) ---
+entry:
+  swing_lookback: 2        # n-bar pivot for swing high/low detection
+  min_wick_ratio: 0.30     # wick must be >= this fraction of total bar range
+  valid_window_bars: 2     # how many 15m candles a setup stays active
+  sl_multiplier: 0.50      # stop = entry_extreme + (trigger_distance * multiplier)
