@@ -1,60 +1,84 @@
 """
-Price data adapter for Coinbase. Pulls 1m + 15m OHLCV candles for BTC/USD.
+Price data adapter — Coinbase Exchange public API.
+Provides spot price and OHLCV candles for BTC-USD.
 """
 import httpx
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
+PRODUCT = "BTC-USD"
+BASE_URL = "https://api.exchange.coinbase.com"
+
+
 async def fetch(asset: str = "BTC/USD", timeframe: str = "1m") -> dict:
-    """Fetch OHLCV from Coinbase or CoinGecko API (paper mode)."""
+    """Current spot price via Coinbase exchange-rates endpoint."""
     try:
         async with httpx.AsyncClient() as client:
-            # Try Coinbase first
-            url = "https://api.coinbase.com/v2/exchange-rates?currency=BTC"
-            resp = await asyncio.wait_for(client.get(url), timeout=5)
+            resp = await asyncio.wait_for(
+                client.get("https://api.coinbase.com/v2/exchange-rates?currency=BTC"),
+                timeout=5,
+            )
             data = resp.json()
-            price = float(data["data"]["rates"].get("USD", 42500))
-            
-            return {
-                "asset": asset,
-                "price": price,
-                "timestamp": datetime.now().isoformat(),
-                "timeframe": timeframe,
-            }
-    except Exception as e:
-        logger.error(f"Coinbase failed, using fallback: {e}")
-        # Fallback to static price for paper mode
+            price = float(data["data"]["rates"]["USD"])
         return {
             "asset": asset,
-            "price": 42500.0,
-            "timestamp": datetime.now().isoformat(),
+            "price": price,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "timeframe": timeframe,
         }
-
-async def fetch_candles(asset: str = "BTC/USD", timeframe: str = "1m", limit: int = 100) -> list:
-    """Fetch OHLCV candles from Coinbase."""
-    try:
-        async with httpx.AsyncClient() as client:
-            # Fallback: CoinGecko
-            url = f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=7"
-            resp = await asyncio.wait_for(client.get(url), timeout=5)
-            data = resp.json()
-            
-            candles = []
-            for ts, price in data["prices"][-limit:]:
-                candles.append({
-                    "timestamp": ts,
-                    "open": price,
-                    "high": price,
-                    "low": price,
-                    "close": price,
-                    "volume": 0,
-                })
-            
-            return candles
     except Exception as e:
-        logger.error(f"Failed to fetch candles: {e}")
-        return []
+        logger.error(f"spot fetch failed: {e}")
+        return {"asset": asset, "price": 0.0, "timestamp": datetime.now(timezone.utc).isoformat(), "timeframe": timeframe}
+
+
+async def fetch_ohlcv(granularity: int = 60, limit: int = 50) -> list:
+    """
+    OHLCV candles from Coinbase Exchange public API.
+
+    granularity: bar size in seconds (60=1m, 900=15m)
+    limit:       number of candles to return (max 300)
+    Returns list of dicts in chronological order (oldest first):
+      {timestamp, open, high, low, close, volume}
+    """
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(seconds=granularity * (limit + 2))
+
+    params = {
+        "granularity": granularity,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+    }
+
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await asyncio.wait_for(
+                    client.get(f"{BASE_URL}/products/{PRODUCT}/candles", params=params),
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                raw = resp.json()  # [[ts, low, high, open, close, vol], ...] newest first
+
+            candles = []
+            for row in reversed(raw):
+                ts, low, high, open_, close, volume = row
+                candles.append({
+                    "timestamp": int(ts),
+                    "open": float(open_),
+                    "high": float(high),
+                    "low": float(low),
+                    "close": float(close),
+                    "volume": float(volume),
+                })
+            return candles[-limit:]
+
+        except Exception as e:
+            wait = 2 ** attempt
+            logger.warning(f"ohlcv fetch attempt {attempt + 1} failed ({e}), retry in {wait}s")
+            await asyncio.sleep(wait)
+
+    logger.error("ohlcv fetch failed after 3 attempts")
+    return []
